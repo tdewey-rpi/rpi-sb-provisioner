@@ -17,22 +17,17 @@ class ParamWidget(Widget):
         self.currentval = currentval
         super().__init__()
     def compose(self) -> ComposeResult:
-        """Create child widgets for the app."""
-        yield Static(self.paramname, classes="paramname")
+        yield Static(self.paramname, classes="paramname", id="nameentry_" + self.paramname)
         yield Input(placeholder=self.paramvalue, classes="paramentry", value=self.currentval, id="param_entry_"+self.paramname)   #, validate_on="blur", validators=[validate(self.paramname)])
         yield Button("Help!", classes="paramhelp", id=self.paramname + "_helpbutton")
 
 class MainScreen(Screen):
     def compose(self) -> ComposeResult:
-            """Create child widgets for the app."""
             yield Header()
             yield Footer()
             for param in defaultparams:
                 yield ParamWidget(paramname=param, paramvalue=defaultparams[param], currentval=initialparams[param])
             yield Container(Button("Write verified params to config file", id="write_button", classes="write_button"), classes="bottom_bar")
-
-            #yield Container(Button("Validate All", id="validate_all_button", classes="validate_button"), Button("Write to config file", id="write_button", classes="validate_button"), classes="bottom_bar")
-
 
 class HelpScreen(Screen):
     def __init__(self, paramname, defaultvalue, currentvalue, optional, helptext):
@@ -45,7 +40,6 @@ class HelpScreen(Screen):
             self.defaultvalue = "None"
         super().__init__()
     def compose(self) -> ComposeResult:
-        """Create child widgets for the app."""
         yield Container(Static(self.paramname + "\n"), Static(self.optional + "\n"), Static(self.helptext + "\n"), Static("Default Value: " + self.defaultvalue + "\n"), Button("OK", id="close_help_screen"), id="dialog")
 
 
@@ -61,7 +55,6 @@ class ValidatedScreen(Screen):
             self.defaultvalue = "None"
         super().__init__()
     def compose(self) -> ComposeResult:
-        """Create child widgets for the app."""
         yield Container(Static("ERROR VALIDATING: " + self.paramname + " - NOT WRITING!" + "\n"),
                         Static("Error is : " + self.errmsg + "\n"),
                         Static("This value is " + self.optional + "\n"),
@@ -72,21 +65,35 @@ class ValidatedScreen(Screen):
 
 
 class OpeningScreen(Screen):
-    def __init__(self, differed_params):
+    def __init__(self, differed_params, mandatory_not_set):
         self.differed_params = ""
-        for param in differed_params:
-            self.differed_params += param + " "
+        self.mandatory_not_set = ""
+        if len(differed_params) != 0:
+            for param in differed_params:
+                self.differed_params += param + " "
+        if len(mandatory_not_set) != 0:
+            for param in mandatory_not_set:
+                self.mandatory_not_set += param + " "
         super().__init__()
     def compose(self) -> ComposeResult:
-        """Create child widgets for the app."""
-        yield Container(Static("WARNING - The parameters: " + self.differed_params + "vary from that suggested in the defaults file!\n"),
+        if self.differed_params == "":
+            warning_text_1 = ""
+        else:
+            warning_text_1 = "WARNING - The parameters: " + self.differed_params + "vary from that suggested in the defaults file!\n"
+        
+        if self.mandatory_not_set == "":
+            warning_text_2 = ""
+        else:
+            warning_text_2 = "WARNING - The Mandatory values: " + self.mandatory_not_set + "have also not been set and will need to be set for provisioner to run!\n"
+        
+        yield Container(Static(warning_text_1),
+                        Static(warning_text_2),
                         Button("OK", id="close_help_screen2"),
                         id="dialog2")
 
 
 
 class App(App):
-    """A Textual app to manage stopwatches."""
     CSS_PATH = "config_app.css"
     BINDINGS = [("q", "quit", "Quit")]
     SCREENS = {"MainScreen": MainScreen()}    
@@ -94,8 +101,8 @@ class App(App):
     def on_mount(self) -> None:
         self.title = "rpi-sb-provisioner config editor"
         self.push_screen(MainScreen())
-        if len(different_from_defaults) > 0:
-            self.push_screen(OpeningScreen(different_from_defaults))
+        if (len(different_from_defaults) > 0) or (len(mandatory_not_set) > 0):
+            self.push_screen(OpeningScreen(different_from_defaults, mandatory_not_set))
 
     def action_mainscreen(self):
         self.pop_screen()
@@ -125,11 +132,16 @@ class App(App):
             if not(success):
                 inputbox = self.query_one("#param_entry_" + paramname)
                 inputbox.classes = "paramentry"
+                nametext = self.query_one("#nameentry_" + paramname)
+                nametext.update("╳ - " + paramname)
                 self.push_screen(ValidatedScreen(paramname, errmsg, defaultparams[paramname], "idk", required[paramname], helper[paramname]))
             if success:
                 inputbox = self.query_one("#param_entry_" + paramname)
                 inputbox.classes = "success_entry"
                 params_to_save[paramname] = event.input.value
+                nametext = self.query_one("#nameentry_" + paramname)
+                nametext.update("✓ - " + paramname)
+
 
 
 
@@ -143,7 +155,7 @@ contents_by_line = f.read().split("\n")
 for line in contents_by_line:
     if len(line.split("=")) > 1:
         defaultparams.update([(line.split("=")[0], line.split("=")[1])])
-        initialparams.update([(line.split("=")[0], "")])
+        initialparams.update([(line.split("=")[0], line.split("=")[1])])
         params_to_save.update([(line.split("=")[0], line.split("=")[1])])
     else:
         defaultparams.update([(line.split("=")[0], "")])
@@ -160,8 +172,6 @@ for line in contents_by_line:
         initialparams.update([(line.split("=")[0], "")])
 initialparams.pop("")
 defaultparams.pop("")
-# print(initialparams)
-# print(defaultparams)
 
 ### Find the differences!
 different_from_defaults = []
@@ -172,21 +182,23 @@ for param in defaultparams:
                 different_from_defaults.append(param)
         else:
             different_from_defaults.append(param)
+
 ### Load helper descriptor!
 helper = {}
 required = {}
+mandatory_not_set = []
 f = open("config_app.helper")
 contents_by_param = f.read().split("\n")
 for line in contents_by_param:
     if len(line.split("|")) > 1:
         helper.update([(line.split("|")[0], line.split("|")[2])])
         required.update([(line.split("|")[0], line.split("|")[1])])
+        if "Mandatory" in required[line.split("|")[0]]:
+            if params_to_save[line.split("|")[0]] == "":
+                mandatory_not_set.append(line.split("|")[0])
     else:
         print("Error - unable to correctly parse helper line: " + line)
-# print(helper)
-# print(required)
 
-print(different_from_defaults)
 if __name__ == "__main__":
     app = App()
     app.run()
