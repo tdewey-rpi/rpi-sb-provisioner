@@ -143,6 +143,8 @@ depends:
   - dctrl-tools
   - diffutils
   - findutils
+  - dpkg
+  - zstd
 
 # Recommended packages. (overridable)
 # This will expand any env var you set in the field, e.g. ${RECOMMENDS_BLA}
@@ -227,6 +229,12 @@ contents:
 
   - src: rpi-package-download/rpi-package-download
     dst: /usr/local/bin/rpi-package-download
+
+  - src: make-boot-image/make-boot-image.service
+    dst: /usr/local/lib/systemd/system/make-boot-image@.service
+
+  - src: make-boot-image/make-boot-image-from-kernel
+    dst: /usr/local/bin/make-boot-image-from-kernel
 
   # This will add all files in some/directory or in subdirectories at the
   # same level under the directory /etc. This means the tree structure in

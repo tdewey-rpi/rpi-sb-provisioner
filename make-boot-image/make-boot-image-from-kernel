@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+
+set -e
+
+# deps:
+#   - dpkg (dpkg-deb)
+#   - openssl
+#   - zstd
+#   - cpio
+
+# TODO: Currently, we just assume we're Pi5/2712.
+# There is currently no functionality to insert firmware for Pi4 and earlier.
+
+TMPDIR="${TMPDIR:=/tmp}"
+
+if [[ -z "${1}" ]]; then
+	>&2 echo "No linux image specified"
+	exit 1
+fi
+
+if [[ -z "${VENDOR}" ]]; then
+	>&2 echo "'VENDOR' not specified"
+	exit 1
+fi
+
+if [[ -z "${OPENSSL}" || ! -f "${OPENSSL}" ]]; then
+	>&2 echo "'OPENSSL' not set or binary does not exist"
+	exit 1
+fi
+
+if [[ -z "${CUSTOMER_KEY_FILE_PEM}" || ! -f "${CUSTOMER_KEY_FILE_PEM}" ]]; then
+	>&2 echo "'CUSTOMER_KEY_FILE_PEM' not set or file does not exist"
+	exit 1
+fi
+
+LINUX_IMAGE="${1}"
+
+# Should be set by systemd
+SERVICE_NAME="make-boot-image@$(systemd-escape $LINUX_IMAGE).service"
+CACHE_DIRECTORY="${CACHE_DIRECTORY:=/var/cache/${SERVICE_NAME}}"
+RUNTUME_DIRECTORY="${RUNTIME_DIRECTORY:=/run/${SERVICE_NAME}}"
+
+# TODO: Might be interesting to start rpi-package-download with --no-block to
+# allow multiple simultaneous downloads.
+function download_package() {
+	systemctl start \
+		--wait \
+		rpi-package-download@$(systemd-escape ${1}).service
+}
+
+KERNEL_2712="linux-image-${LINUX_IMAGE}"
+>&2 echo "Downloading ${KERNEL_2712}"
+download_package "$KERNEL_2712"
+
+PACKAGE_NAME="boot-image-${VENDOR}-${LINUX_IMAGE}"
+
+# Temp directory cleanup
+TEMP_DIRS=()
+function remove_temp_dirs() {
+	>&2 echo "Removing temporary directories"
+	for dir in "${TEMP_DIRS[@]}"
+	do
+		rm -rf "$dir"
+	done
+}
+trap remove_temp_dirs EXIT
+
+>&2 echo -n "Creating filesystem hierarchy for deb package: "
+DEB_HIER="$(mktemp --directory --tmpdir debhier.XXX)"
+TEMP_DIRS+=("${DEB_HIER}")
+>&2 echo "${DEB_HIER}"
+
+>&2 echo -n "Create rootfs working directory: "
+WORK_DIR="$(mktemp --directory --tmpdir boot-image-rootfs.XXX)"
+TEMP_DIRS+=("${WORK_DIR}")
+>&2 echo "${WORK_DIR}"
+
+function latest_pkg_dir() {
+	echo "/var/cache/rpi-package-download@$(systemd-escape ${1}).service/latest"
+}
+
+>&2 echo "Extracting package contents"
+dpkg-deb --raw-extract "$(latest_pkg_dir $KERNEL_2712)/package.deb" "${WORK_DIR}"
+
+function get_dctrl_field() {
+	grep-dctrl \
+		--field=Package \
+		--exact-match "${2}" \
+		--no-field-names \
+		--show-field="${3}" \
+		"${1}"
+}
+
+# Determine package version for later reuse
+KERNEL_2712_VERSION="$(get_dctrl_field ${WORK_DIR}/DEBIAN/control ${KERNEL_2712} Version)"
+>&2 echo "Extracted ${KERNEL_2712}, version ${KERNEL_2712_VERSION}"
+
+# rootfs kernel modules
+>&2 echo "Copy kernel modules into deb package"
+mkdir -p "${DEB_HIER}/lib/modules"
+rsync -crt "${WORK_DIR}/lib/modules/"* "${DEB_HIER}/lib/modules"
+
+>&2 echo -n "Create ramdisk working directory: "
+BFS_DIR="$(mktemp --directory --tmpdir boot-image-bootfs.XXX)"
+TEMP_DIRS+=("${BFS_DIR}")
+>&2 echo "${BFS_DIR}"
+
+# Kernel Images
+>&2 echo "Copy kernel to ramdisk"
+cp "${WORK_DIR}/boot/vmlinuz-${LINUX_IMAGE}" "${BFS_DIR}/zImage"
+
+# Overlays
+>&2 echo "Copy overlays to ramdisk"
+OVERLAY_PATH="${WORK_DIR}/usr/lib/${KERNEL_2712}/overlays"
+rsync -crt "${OVERLAY_PATH}"/*.dtb* "${OVERLAY_PATH}/README" "${BFS_DIR}/overlays"
+
+# DTBs
+>&2 echo "Copy DTBs to ramdisk"
+DTB_PATH="${WORK_DIR}/usr/lib/${KERNEL_2712}/broadcom"
+rsync -crt "${DTB_PATH}"/bcm27*.dtb "${BFS_DIR}"
+
+# Insert an initramfs
+>&2 echo "Add cryptoot initramfs to ramdisk (with necessary kernel modules)"
+INITRAMFS_EXTRACT="$(mktemp --directory --tmpdir initramfs-extract.XXX)"
+TEMP_DIRS+=("${INITRAMFS_EXTRACT}")
+zstd -q -d /usr/share/misc/cryptroot_initramfs -o "${INITRAMFS_EXTRACT}/initramfs.cpio"
+mkdir -p "${INITRAMFS_EXTRACT}/initramfs"
+pushd "${INITRAMFS_EXTRACT}/initramfs" > /dev/null
+cpio --quiet -id < ../initramfs.cpio > /dev/null
+rm ../initramfs.cpio
+pushd "${WORK_DIR}" > /dev/null
+find lib/modules \
+	\( \
+		-name 'dm-mod.*' \
+		-o \
+		-name 'dm-crypt.*' \
+		-o \
+		-name 'af_alg.*' \
+		-o \
+		-name 'algif_skcipher.*' \
+		-o \
+		-name 'libaes.*' \
+		-o \
+		-name 'aes_generic.*' \
+		-o \
+		-name 'aes-arm64.*' \
+	\) \
+	-exec cp -r --parents "{}" "${INITRAMFS_EXTRACT}/initramfs/usr/" \;
+popd > /dev/null
+find . -print0 | cpio --quiet --null -ov --format=newc > ../initramfs.cpio 2> /dev/null
+popd > /dev/null
+zstd -q -6 "${INITRAMFS_EXTRACT}/initramfs.cpio" -o "${BFS_DIR}/rootfs.cpio.zst"
+
+# cmdline.txt
+>&2 echo "Add cmdline.txt to ramdisk"
+# TODO: Needs to be user-modifiable
+echo "rootwait console=tty0 console=serial0,115200 root=/dev/ram0" > "${BFS_DIR}/cmdline.txt"
+
+# Inner config.txt
+>&2 echo "Add config.txt to ramdisk"
+# TODO: Needs to be user-modifiable
+echo \
+'[all]
+kernel=zImage
+initramfs rootfs.cpio.zst
+enable_uart=1
+uart_2ndstage=1
+disable_overscan=1
+cmdline=cmdline.txt
+
+[cm4]
+dtoverlay=dwc2,dr_mode=host
+
+[none]
+' > "${BFS_DIR}/config.txt"
+
+# Invoke make-boot-image
+>&2 echo "Finalise ramdisk in deb package (boot.img)"
+mkdir -p "${DEB_HIER}/boot/firmware"
+# TODO: Assuming pi5 here
+make-boot-image \
+	-b pi5 \
+	-d "${BFS_DIR}" \
+	-o "${DEB_HIER}/boot/firmware/boot.img" > /dev/null
+
+# Outer config.txt
+>&2 echo "Add config.txt to deb package (ensure boot.img is used)"
+cp /usr/share/misc/boot_ramdisk_config.txt "${DEB_HIER}/boot/firmware/config.txt"
+
+# boot.sig generation
+>&2 echo "Signing ramdisk image"
+sha256sum "${DEB_HIER}/boot/firmware/boot.img" | awk '{print $1}' > "${DEB_HIER}/boot/firmware/boot.sig"
+echo -n "rsa2048: " >> "${DEB_HIER}/boot/firmware/boot.sig"
+${OPENSSL} dgst \
+	-sign "${CUSTOMER_KEY_FILE_PEM}" \
+	-keyform PEM \
+	-sha256 \
+	"${DEB_HIER}/boot/firmware/boot.img" \
+	| xxd -c 4096 -p >> "${DEB_HIER}/boot/firmware/boot.sig"
+
+# Insert control file
+# TODO: Needs to be user modifiable
+# TODO: depends on kmod, linux-base, etc?
+# TODO: breaks for fwupdate, initramfs-tools, etc?
+mkdir "${DEB_HIER}/DEBIAN"
+echo \
+"Package: ${PACKAGE_NAME}
+Source: linux
+Version: ${KERNEL_2712_VERSION}
+Architecture: arm64
+Maintainer: John Smith <john.smith@example.com>
+Section: kernel
+Priority: optional
+Homepage: https://github.com/raspberrypi/linux/
+Provides: ${KERNEL_2712}
+Conflicts: ${KERNEL_2712}
+Replaces: ${KERNEL_2712}
+Description: TODO: Provide a better description" \
+> "${DEB_HIER}/DEBIAN/control"
+
+# Create Debian package
+dpkg-deb --build "${DEB_HIER}" "${CACHE_DIRECTORY}"
